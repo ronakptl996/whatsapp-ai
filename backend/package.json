@@ -30,6 +30,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
+    "long": "^4.0.0",
     "node-cache": "^5.1.2"
   }
 }
