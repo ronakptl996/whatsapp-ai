@@ -3,6 +3,9 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import fs from "fs";
+import { generalRateLimit } from "./middleware/rateLimiter";
+import { notFoundHandler, errorHandler } from "./middleware/errorHandler";
+import whatsAppRoute from "./routes/whatsApp.routes";
 
 const app = express();
 
@@ -10,71 +13,51 @@ dotenv.config({
   path: "./.env",
 });
 
+// Create necessary directories
+if (!fs.existsSync("./sessions")) {
+  fs.mkdirSync("./sessions", { recursive: true });
+}
+if (!fs.existsSync("./temp")) {
+  fs.mkdirSync("./temp", { recursive: true });
+}
+if (!fs.existsSync("./logs")) {
+  fs.mkdirSync("./logs", { recursive: true });
+}
+
+// Middleware
 app.use(express.static("temp"));
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN,
+    origin: process.env.CORS_ORIGIN || "*",
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
-  })
+  }),
 );
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true, limit: "16kb" }));
 app.use(cookieParser());
 
-import whatsAppRoute from "./routes/whatsApp.routes";
+// Apply general rate limiting
+app.use(generalRateLimit);
 
-if (!fs.existsSync("./sessions")) {
-  fs.mkdirSync("./sessions", { recursive: true });
-}
-
-// Whatsapp pair route
+// Routes
 app.use("/api/whatsapp", whatsAppRoute);
 
-// async function connectToWhatsApp() {
-//   const { state, saveCreds } = await useMultiFileAuthState("auth_info_baileys");
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Server is running",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  });
+});
 
-//   const sock = makeWASocket({
-//     // can provide additional config here
-//     printQRInTerminal: true,
-//     auth: state,
-//   });
-//   sock.ev.on("connection.update", (update) => {
-//     const { connection, lastDisconnect } = update;
-//     if (connection === "close") {
-//       const shouldReconnect =
-//         (lastDisconnect.error as Boom)?.output?.statusCode !==
-//         DisconnectReason.loggedOut;
-//       console.log(
-//         "connection closed due to ",
-//         lastDisconnect.error,
-//         ", reconnecting ",
-//         shouldReconnect
-//       );
-//       // reconnect if not logged out
-//       if (shouldReconnect) {
-//         connectToWhatsApp();
-//       }
-//     } else if (connection === "open") {
-//       console.log("opened connection");
-//     }
-//   });
-//   sock.ev.on("messages.upsert", async (m) => {
-//     // console.log(JSON.stringify(m, undefined, 2));
-//     console.log(JSON.stringify(m.messages[0].message, undefined, 2));
+// 404 handler
+app.use(notFoundHandler);
 
-//     if (m.messages[0].message.conversation.includes("ping")) {
-//       console.log("replying to", m.messages[0].key.remoteJid);
-//       await sock.sendMessage(m.messages[0].key.remoteJid!, {
-//         text: "Pong!",
-//       });
-//     }
-//   });
-
-//   sock.ev.on("creds.update", saveCreds);
-// }
-
-// connectToWhatsApp();
+// Error handling middleware (must be last)
+app.use(errorHandler);
 
 export { app };

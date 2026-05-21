@@ -1,21 +1,19 @@
 import { Request, Response } from "express";
 import fs from "fs";
 import NodeCache from "node-cache";
-import makeWASocket, {
-  DisconnectReason,
-  useMultiFileAuthState,
-} from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import { asyncHandler } from "../utils/asyncHandler";
 import { ApiError } from "../utils/ApiError";
 import { ApiResponse } from "../utils/ApiResponse";
 import { supabase } from "../utils/Supabase";
+import { logger } from "../utils/logger";
+import { processMessage } from "../services/messageHandlers";
 
-async function deleteSession(phoneNumber) {
+async function deleteSession(phoneNumber: string) {
   const sessionDir = `./sessions/${phoneNumber}`;
   if (fs.existsSync(sessionDir)) {
     fs.rmSync(sessionDir, { recursive: true, force: true });
-    console.log(`${phoneNumber} Deleted from Sessions`);
+    logger.info(`${phoneNumber} Deleted from Sessions`);
   }
   await supabase.from("bot").delete().eq("contact", phoneNumber);
   await supabase.from("users").delete().eq("contact", phoneNumber);
@@ -31,9 +29,9 @@ function getPhoneNumbersFromSessions() {
   return sessionDirectories;
 }
 
-async function restoreSessionFromDB(phoneNumber, filePath) {
+async function restoreSessionFromDB(phoneNumber: string, filePath: string) {
   try {
-    console.log(`Restoring session for phone number: ${phoneNumber}`);
+    logger.info(`Restoring session for phone number: ${phoneNumber}`);
     const sessionDir = `./sessions/${phoneNumber}`;
     if (!fs.existsSync(sessionDir)) {
       fs.mkdirSync(sessionDir, { recursive: true });
@@ -43,6 +41,11 @@ async function restoreSessionFromDB(phoneNumber, filePath) {
       .from("session-files")
       .download(filePath);
 
+    if (error) {
+      logger.error("Error downloading session file", { error, phoneNumber });
+      return;
+    }
+
     const fileData = await data.text();
 
     if (typeof fileData === "object") {
@@ -50,16 +53,48 @@ async function restoreSessionFromDB(phoneNumber, filePath) {
     }
     await createBot(phoneNumber);
   } catch (error) {
-    console.error("Error restoring session:", error);
+    logger.error("Error restoring session", { error, phoneNumber });
   }
 }
 
-async function createBot(phoneNumber: string) {
+interface BotCreateResult {
+  socket: any;
+  pairingCode: string | null;
+}
+
+async function createBot(
+  phoneNumber: string,
+  requestPairing: boolean = false,
+): Promise<BotCreateResult> {
   try {
+    const {
+      default: makeWASocket,
+      DisconnectReason,
+      useMultiFileAuthState,
+    } = await import("baileys");
     const sessionDir = `./sessions/${phoneNumber}`;
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const msgRetryCounterCache = new NodeCache();
+
+    // flag to prevent multiple pairing code requests
+    let pairingRequested = false;
+
+    // Promise to resolve with pairing code if requested
+    let resolvePairingCode: ((code: string) => void) | null = null;
+    let rejectPairingCode: ((error: any) => void) | null = null;
+
+    const pairingCodePromise = requestPairing
+      ? new Promise<string>((resolve, reject) => {
+          resolvePairingCode = resolve;
+          rejectPairingCode = reject;
+          // Timeout after 30 seconds
+          setTimeout(
+            () => reject(new Error("Pairing code request timeout")),
+            30000,
+          );
+        })
+      : null;
 
     const Matrix = makeWASocket({
       printQRInTerminal: false,
@@ -67,59 +102,91 @@ async function createBot(phoneNumber: string) {
       auth: state,
       markOnlineOnConnect: true,
       generateHighQualityLinkPreview: true,
+      version: [2, 3000, 1033893291],
       getMessage: async (key) => ({ conversation: "Hello, World!" }),
       msgRetryCounterCache,
     });
 
     Matrix.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect } = update;
+      const { connection, lastDisconnect, qr } = update;
+      logger.debug("Connection update", { connection, qr });
 
       if (connection === "close") {
         const shouldReconnect =
-          (lastDisconnect.error as Boom)?.output?.statusCode !==
+          (lastDisconnect?.error as Boom)?.output?.statusCode !==
           DisconnectReason.loggedOut;
 
         if (shouldReconnect) {
-          setTimeout(() => createBot(phoneNumber), 5000);
+          logger.info(`Reconnecting ${phoneNumber}`);
+          setTimeout(() => createBot(phoneNumber, false), 5000);
         } else {
-          console.log(`== Phone number ${phoneNumber}, Device logged out.`);
+          logger.warn(`Device ${phoneNumber} logged out`);
           await deleteSession(phoneNumber);
         }
       } else if (connection === "open") {
-        console.log(`Device ${phoneNumber} connected to WhatsApp.`);
+        logger.info(`Device ${phoneNumber} connected to WhatsApp`);
+      } else if (
+        (connection === "connecting" || !!qr) &&
+        requestPairing &&
+        !pairingRequested
+      ) {
+        pairingRequested = true;
+        logger.info(
+          `Device ${phoneNumber} is connecting, requesting pairing code`,
+        );
+        try {
+          setTimeout(async () => {
+            const code = await Matrix.requestPairingCode(phoneNumber);
+            logger.info(`Pairing code generated for ${phoneNumber}`, { code });
+
+            if (resolvePairingCode) {
+              resolvePairingCode(code);
+            }
+          }, 3000);
+        } catch (error) {
+          logger.error("Error generating pairing code", { error, phoneNumber });
+          pairingRequested = false;
+          if (rejectPairingCode) {
+            rejectPairingCode(error);
+          }
+        }
       }
     });
 
     Matrix.ev.on("creds.update", saveCreds);
 
-    // Handle incoming messages specifically for the current device
+    // Handle incoming messages
     Matrix.ev.on("messages.upsert", async (m) => {
-      if (
-        m.messages[0].message &&
-        ((m.messages[0].message.conversation &&
-          m.messages[0].message.conversation.toLowerCase().includes("ping")) ||
-          (m.messages[0].message.extendedTextMessage &&
-            m.messages[0].message.extendedTextMessage.text
-              .toLowerCase()
-              .includes("ping")))
-      ) {
-        await Matrix.sendMessage(m.messages[0].key.remoteJid!, {
-          text: "Pong!",
-        });
+      logger.debug("Messages upsert received", {
+        type: m.type,
+        count: m.messages.length,
+      });
+
+      if (m.type === "notify") {
+        for (const message of m.messages) {
+          await processMessage(message, Matrix, message.key);
+        }
       }
     });
 
-    const { data } = await supabase
+    const { data, error: botQueryError } = await supabase
       .from("bot")
       .select(
         `
           id,
           contact
-        `
+        `,
       )
       .eq("contact", parseInt(phoneNumber));
 
-    if (data.length === 0) {
+    if (botQueryError) {
+      logger.error("Error querying bot from Supabase", {
+        error: botQueryError,
+        phoneNumber,
+      });
+    }
+
+    if (data && data.length === 0) {
       const credsPath = `${sessionDir}/creds.json`;
 
       if (fs.existsSync(credsPath)) {
@@ -132,7 +199,10 @@ async function createBot(phoneNumber: string) {
           });
 
         if (error) {
-          console.error("Error uploading session file to Supabase:", error);
+          logger.error("Error uploading session file to Supabase", {
+            error,
+            phoneNumber,
+          });
           throw new ApiError(500, "Error uploading session file to Supabase");
         }
 
@@ -142,23 +212,35 @@ async function createBot(phoneNumber: string) {
             .insert([
               {
                 contact: phoneNumber,
-                filePath: storageData?.fullPath,
-                filePathId: storageData?.id,
+                filePath: storageData.fullPath,
+                filePathId: storageData.id,
               },
             ])
             .select();
 
           if (error) {
-            console.error("Error creating bot to Supabase:", error);
+            logger.error("Error creating bot in Supabase", {
+              error,
+              phoneNumber,
+            });
+          } else {
+            logger.info("Created User Bot", { data, phoneNumber });
           }
-          console.log("Created User Bot >>>", data);
         }
       }
     }
-    return Matrix;
+
+    // Return socket and pairing code promise if requested
+    if (requestPairing && pairingCodePromise) {
+      const pairingCode = await pairingCodePromise;
+      return { socket: Matrix, pairingCode };
+    }
+
+    return { socket: Matrix, pairingCode: null };
   } catch (error) {
-    console.error("Error creating bot:", error);
+    logger.error("Error creating bot", { error, phoneNumber });
     await deleteSession(phoneNumber);
+    throw error;
   }
 }
 
@@ -177,42 +259,43 @@ const pairingRoute = asyncHandler(async (req: Request, res: Response) => {
       if (!oldNumber) {
         return res
           .status(400)
-          .json(new ApiResponse(400, [], "Number is required!"));
+          .json(new ApiResponse(400, [], "Old number is required for updates"));
       }
     }
 
     phoneNumber = phoneNumber.replace(/[^0-9]/g, "");
 
-    console.log(`Creating bot for phone number: ${phoneNumber}, Device.`);
-    const bot = await createBot(phoneNumber);
+    logger.info(`Creating bot for phone number: ${phoneNumber}`, { isUpdate });
+    const result = await createBot(phoneNumber, true);
 
-    if (!bot) {
+    if (!result || !result.socket) {
       throw new ApiError(500, "Bot creation failed");
     }
 
-    setTimeout(async () => {
-      try {
-        let code = await bot.requestPairingCode(phoneNumber);
-        code = code?.match(/.{1,4}/g)?.join("-") || code;
-        return res
-          .status(201)
-          .json(
-            new ApiResponse(
-              201,
-              { pairingCode: code },
-              "Pairing code generated"
-            )
-          );
-      } catch (error) {
-        console.error("Error generating pairing code:", error);
-        await deleteSession(phoneNumber);
-        return res
-          .status(500)
-          .json(new ApiResponse(500, [], "Error generating pairing code"));
-      }
-    }, 3000);
+    if (!result.pairingCode) {
+      throw new ApiError(500, "Failed to generate pairing code");
+    }
+
+    // Format pairing code with dashes for better readability (e.g., "1234-5678")
+    const formattedCode =
+      result.pairingCode.match(/.{1,4}/g)?.join("-") || result.pairingCode;
+
+    logger.info(`Pairing code generated successfully`, { phoneNumber });
+
+    return res
+      .status(201)
+      .json(
+        new ApiResponse(
+          201,
+          { pairingCode: formattedCode },
+          "Pairing code generated successfully",
+        ),
+      );
   } catch (error) {
-    console.log("Error >>", error);
+    logger.error("Error generating pairing code", {
+      error,
+      phoneNumber: req.body.phoneNumber,
+    });
     return res
       .status(500)
       .json(new ApiError(500, "Error generating pairing code"));
@@ -220,22 +303,44 @@ const pairingRoute = asyncHandler(async (req: Request, res: Response) => {
 });
 
 async function reloadBots() {
-  const phoneNumbers = getPhoneNumbersFromSessions();
+  try {
+    logger.info("Reloading all bots...");
 
-  const { data } = await supabase.from("bot").select();
-  const phoneNumbersInDB = data?.map((user) => user.contact) || [];
+    const phoneNumbers = getPhoneNumbersFromSessions();
+    logger.info(`Found ${phoneNumbers.length} local sessions`);
 
-  for (const phoneNumber of phoneNumbers) {
-    await createBot(phoneNumber);
-  }
+    const { data, error } = await supabase.from("bot").select();
 
-  for (const phoneNumber of phoneNumbersInDB) {
-    if (!phoneNumbers.includes(String(phoneNumber))) {
-      const user = data.find((user) => user.contact === Number(phoneNumber));
-      if (user) {
-        await restoreSessionFromDB(phoneNumber, user.filePath.slice(14));
+    if (error) {
+      logger.error("Error fetching bots from Supabase", { error });
+      return;
+    }
+
+    const phoneNumbersInDB = data?.map((user) => user.contact) || [];
+    logger.info(`Found ${phoneNumbersInDB.length} bots in database`);
+
+    // Restore bots from local sessions
+    for (const phoneNumber of phoneNumbers) {
+      logger.info(`Restoring bot from local session: ${phoneNumber}`);
+      await createBot(phoneNumber);
+    }
+
+    // Restore bots from DB that don't have local sessions
+    for (const phoneNumber of phoneNumbersInDB) {
+      if (!phoneNumbers.includes(String(phoneNumber))) {
+        const user = data.find((user) => user.contact === Number(phoneNumber));
+        if (user) {
+          logger.info(`Restoring bot from DB: ${phoneNumber}`);
+          await restoreSessionFromDB(phoneNumber, user.filePath.slice(14));
+        }
       }
     }
+
+    logger.info("Bot reload completed successfully");
+  } catch (error) {
+    logger.error("Error during bot reload", { error });
+    throw error;
   }
 }
+
 export { pairingRoute, reloadBots };

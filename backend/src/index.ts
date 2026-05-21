@@ -1,17 +1,22 @@
 import dotenv from "dotenv";
 import { app } from "./app";
 import { reloadBots } from "./controllers/whatsApp.controllers";
+import { logger } from "./utils/logger";
 
 dotenv.config({
   path: "./.env",
 });
 
-app.listen(process.env.PORT || 8000, () => {
+const PORT = process.env.PORT || 8000;
+
+app.listen(PORT, () => {
+  logger.info(`Starting server on port ${PORT}...`);
+  
   reloadBots()
     .then(() => {
-      console.log(`⚙️ Server is running at port : ${process.env.PORT}`);
+      logger.info(`⚙️ Server is running at port: ${PORT}`);
     })
     .catch((err) => {
-      console.log("Error while reloadBots >>", err);
+      logger.error("Error while reloading bots", { error: err });
     });
 });

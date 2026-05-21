@@ -1,11 +1,9 @@
 <script setup>
-import { reactive } from "vue";
-import { supabase } from "../lib/supabase";
-import { useToast } from "vue-toast-notification";
-import "vue-toast-notification/dist/theme-sugar.css";
-import router from "../router";
+import { reactive, ref } from "vue";
+import { useAuth } from "../composables/useAuth";
+import { RouterLink } from "vue-router";
 
-const $toast = useToast();
+const { signup, verifyOTP, loading } = useAuth();
 
 const formData = reactive({
   email: "",
@@ -15,93 +13,38 @@ const formData = reactive({
   otp: "",
 });
 
-const verifyOTPHandler = async () => {
-  console.log("OTP >>", formData.otp);
+const showPassword = ref(false);
+
+const handleSubmit = async () => {
+  if (!formData.email || !formData.password || !formData.name) {
+    return;
+  }
+
+  if (formData.password.length < 6) {
+    return;
+  }
+
   try {
-    const { data, error } = await supabase.auth.verifyOtp({
-      email: formData.email,
-      token: formData.otp,
-      type: "email",
-    });
-
-    if (error) {
-      console.log("Error >>", error);
-      $toast.error(error.message, {
-        position: "top-right",
-      });
-      return;
+    const data = await signup(formData.email, formData.password, formData.name);
+    
+    // If email verification is required
+    if (data?.user && !data.user.email_confirmed_at) {
+      formData.verifyOTP = true;
     }
-
-    if (data) {
-      $toast.success("User verify successfully!", {
-        position: "top-right",
-      });
-      router.push("/setup-api");
-    }
-    console.log("VERIFY USER DATA >>", data);
   } catch (error) {
-    console.log("Error >>", error);
-
-    $toast.error("Something went wrong!", {
-      position: "top-right",
-    });
+    // Error handled in composable
   }
 };
 
-const handleSubmit = async () => {
+const handleOTPVerification = async () => {
+  if (!formData.otp) {
+    return;
+  }
+
   try {
-    if (
-      formData.email == "" ||
-      formData.password == "" ||
-      formData.name == ""
-    ) {
-      $toast.error("All fields are required!", {
-        position: "top-right",
-      });
-      return;
-    }
-
-    if (formData.password.length < 6) {
-      $toast.error("Password length must be 6 character long!", {
-        position: "top-right",
-      });
-      return;
-    }
-
-    const { data, error } = await supabase.auth.signUp({
-      email: formData.email,
-      password: formData.password,
-      options: {
-        data: {
-          name: formData.name,
-        },
-        emailRedirectTo: "http://localhost:5173/setup-api",
-      },
-    });
-
-    if (error) {
-      console.log("Error >>", error);
-      $toast.error(error.message, {
-        position: "top-right",
-      });
-      return;
-    }
-
-    if (data) {
-      $toast.success(
-        "Register successfully!, we send you email verify your account",
-        {
-          position: "top-right",
-        }
-      );
-      formData.verifyOTP = true;
-    }
-    console.log("DATA >>>", data);
+    await verifyOTP(formData.email, formData.otp);
   } catch (error) {
-    console.log("ERROR >>", error);
-    $toast.error("Something went wrong!", {
-      position: "top-right",
-    });
+    // Error handled in composable
   }
 };
 </script>
@@ -111,6 +54,7 @@ const handleSubmit = async () => {
     <div
       class="w-full max-w-sm p-4 border rounded-lg shadow sm:p-6 md:p-8 bg-gray-800 border-gray-700"
     >
+      <!-- Registration Form -->
       <form
         v-if="!formData.verifyOTP"
         class="space-y-6"
@@ -118,10 +62,9 @@ const handleSubmit = async () => {
         @submit.prevent="handleSubmit"
       >
         <h5 class="text-xl font-medium text-white">Sign up to our platform</h5>
+        
         <div>
-          <label for="name" class="block mb-2 text-sm font-medium text-white"
-            >Name</label
-          >
+          <label for="name" class="block mb-2 text-sm font-medium text-white">Name</label>
           <input
             type="text"
             name="name"
@@ -129,12 +72,12 @@ const handleSubmit = async () => {
             placeholder="Enter your name"
             v-model="formData.name"
             required
+            :disabled="loading"
           />
         </div>
+        
         <div>
-          <label for="email" class="block mb-2 text-sm font-medium text-white"
-            >Email</label
-          >
+          <label for="email" class="block mb-2 text-sm font-medium text-white">Email</label>
           <input
             type="email"
             name="email"
@@ -142,44 +85,56 @@ const handleSubmit = async () => {
             placeholder="Enter your Email"
             v-model="formData.email"
             required
+            :disabled="loading"
           />
         </div>
 
         <div>
-          <label
-            for="password"
-            class="block mb-2 text-sm font-medium text-white"
-            >Password</label
-          >
-          <input
-            type="password"
-            name="password"
-            class="border text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 bg-gray-600 border-gray-500 placeholder-gray-400 text-white"
-            placeholder="Enter your Password"
-            v-model="formData.password"
-            required
-          />
+          <label for="password" class="block mb-2 text-sm font-medium text-white">Password</label>
+          <div class="relative">
+            <input
+              :type="showPassword ? 'text' : 'password'"
+              name="password"
+              class="border text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 pr-10 bg-gray-600 border-gray-500 placeholder-gray-400 text-white"
+              placeholder="Enter your Password"
+              v-model="formData.password"
+              required
+              minlength="6"
+              :disabled="loading"
+            />
+            <button
+              type="button"
+              @click="showPassword = !showPassword"
+              class="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-white"
+            >
+              {{ showPassword ? '🙈' : '👁️' }}
+            </button>
+          </div>
+          <p class="text-xs text-gray-400 mt-1">Password must be at least 6 characters</p>
         </div>
 
         <button
           type="submit"
-          class="w-full text-white focus:ring-4 focus:outline-none font-medium rounded-lg text-sm px-5 py-2.5 text-center bg-blue-600 hover:bg-blue-700 focus:ring-blue-800"
+          class="w-full text-white focus:ring-4 focus:outline-none font-medium rounded-lg text-sm px-5 py-2.5 text-center bg-blue-600 hover:bg-blue-700 focus:ring-blue-800 disabled:opacity-50 disabled:cursor-not-allowed"
+          :disabled="loading"
         >
-          Sign Up
+          <span v-if="loading">Signing up...</span>
+          <span v-else>Sign Up</span>
         </button>
+        
         <span class="text-sm block text-center text-slate-300">
           Already have an account?
-          <RouterLink to="/login" class="underline decoration-slate-50"
-            >Signin</RouterLink
-          >
+          <RouterLink to="/login" class="underline decoration-slate-50">Sign in</RouterLink>
         </span>
       </form>
 
-      <form v-else @submit.prevent="verifyOTPHandler">
+      <!-- OTP Verification Form -->
+      <form v-else @submit.prevent="handleOTPVerification">
         <div class="text-center">
           <h5 class="text-xl font-medium text-white">Verify your OTP</h5>
-          <p class="text-sm text-white mt-1">We sent OTP to your email</p>
+          <p class="text-sm text-gray-400 mt-1">We sent an OTP to your email</p>
         </div>
+        
         <div class="mt-5">
           <input
             type="text"
@@ -188,14 +143,22 @@ const handleSubmit = async () => {
             placeholder="Enter OTP"
             v-model="formData.otp"
             required
+            :disabled="loading"
           />
         </div>
+        
         <button
           type="submit"
-          class="w-full text-white mt-3 focus:outline-none font-medium rounded-lg text-sm px-5 py-2.5 text-center bg-blue-600 hover:bg-blue-700 focus:ring-blue-800"
+          class="w-full text-white mt-3 focus:outline-none font-medium rounded-lg text-sm px-5 py-2.5 text-center bg-blue-600 hover:bg-blue-700 focus:ring-blue-800 disabled:opacity-50 disabled:cursor-not-allowed"
+          :disabled="loading"
         >
-          Verify
+          <span v-if="loading">Verifying...</span>
+          <span v-else>Verify</span>
         </button>
+        
+        <p class="text-xs text-gray-400 mt-3 text-center">
+          Didn't receive OTP? Check your spam folder
+        </p>
       </form>
     </div>
   </section>
