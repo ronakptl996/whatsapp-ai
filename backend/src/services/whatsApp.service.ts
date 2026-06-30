@@ -1,14 +1,9 @@
-import { GoogleGenAI } from "@google/genai";
 import * as fs from "node:fs";
 import dotenv from "dotenv";
 import { logger } from "../utils/logger";
 
 dotenv.config({
   path: "../../.env",
-});
-
-const genai = new GoogleGenAI({
-  apiKey: process.env.GOOGLE_API_KEY,
 });
 
 const SystemPrompt = `
@@ -112,6 +107,54 @@ export const chatWithAI = async (message: string) => {
   } catch (error) {
     console.error("Error in chatWithAI", error);
     throw error;
+  }
+};
+
+export const generateImage = async (prompt: string): Promise<string | null> => {
+  try {
+    const hfToken = process.env.HF_TOKEN;
+    if (!hfToken) {
+      throw new Error("HF_TOKEN not configured in environment");
+    }
+
+    const response = await fetch(
+      "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
+      {
+        headers: {
+          Authorization: `Bearer ${hfToken}`,
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+        body: JSON.stringify({ inputs: prompt }),
+      },
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      if (response.status === 503) {
+        throw new Error("Model is loading, please try again in a few seconds");
+      }
+      throw new Error(
+        `Hugging Face API Error: ${response.status} ${errorText}`,
+      );
+    }
+
+    const imageBuffer = Buffer.from(await response.arrayBuffer());
+    const timestamp = Date.now();
+    const filename = `temp/image_${timestamp}.png`;
+
+    if (!fs.existsSync("temp")) {
+      fs.mkdirSync("temp", { recursive: true });
+    }
+
+    fs.writeFileSync(filename, new Uint8Array(imageBuffer));
+    return filename;
+  } catch (error: any) {
+    logger.error("Image generation failed", {
+      error: error.message,
+      prompt,
+    });
+    throw new Error(`Failed to generate image: ${error.message}`);
   }
 };
 

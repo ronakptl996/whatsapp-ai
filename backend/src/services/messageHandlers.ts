@@ -1,5 +1,5 @@
 import { logger } from "../utils/logger";
-import { chatWithAI, generateAIImage } from "./whatsApp.service";
+import { chatWithAI, generateImage } from "./whatsApp.service";
 
 interface MessageHandler {
   pattern: RegExp;
@@ -87,7 +87,7 @@ const handleImageGeneration = async (message: any, sock: any, key: any) => {
     });
 
     // Generate the image
-    const imagePath = await generateAIImage(prompt);
+    const imagePath = await generateImage(prompt);
 
     if (imagePath) {
       // Send the generated image
